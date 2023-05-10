@@ -1,7 +1,6 @@
 import argparse
 
 import numpy as np
-from transformers import BertTokenizer
 
 import torch
 from torch import nn
@@ -16,40 +15,44 @@ class TextDDPM(nn.Module):
         """
         super().__init__()
         self.ddpm = ddpm
-        ddpm_hidden_dim = self.ddpm.embed_tokens.weight.shape[-1]
+        # ddpm_hidden_dim = args.ddpm_dim
         if not hasattr(self.ddpm, "input_projection"):
-            if args.embedding_dim == ddpm_hidden_dim:
+            if args.embedding_dim == args.ddpm_dim:
                 self.ddpm.input_projection = nn.Identity()
                 self.ddpm.output_projection = nn.Identity()
             else:
                 self.ddpm.input_projection = nn.Sequential(
-                    nn.Linear(args.embedding_dim, ddpm_hidden_dim),
+                    nn.Linear(args.embedding_dim, args.ddpm_dim),
                     nn.Tanh(),
-                    nn.Linear(ddpm_hidden_dim, ddpm_hidden_dim)
+                    nn.Linear(args.ddpm_dim, args.ddpm_dim)
                 )
                 self.ddpm.output_projection = nn.Sequential(
-                    nn.Linear(ddpm_hidden_dim, ddpm_hidden_dim),
+                    nn.Linear(args.ddpm_dim, args.ddpm_dim),
                     nn.Tanh(),
-                    nn.Linear(ddpm_hidden_dim, args.embedding_dim)
+                    nn.Linear(args.ddpm_dim, args.embedding_dim)
                 )
         if not hasattr(self.ddpm, "time_emb"):
             self.ddpm.time_emb = nn.Sequential(
-                nn.Linear(args.hidden_t_dim, args.hidden_t_dim * 4),
+                nn.Linear(args.hidden_t_dim, args.hidden_t_dim * 2),
                 nn.SiLU(),
-                nn.Linear(args.hidden_t_dim * 4, ddpm_hidden_dim),
+                nn.Linear(args.hidden_t_dim * 2, args.ddpm_dim),
             )
+        if not hasattr(self.ddpm, "position_embeddings"):
+            self.ddpm.position_embeddings = nn.Embedding(args.max_text_len, args.ddpm_dim)
+        self.register_buffer("position_ids", torch.arange(args.max_text_len).expand((1, -1)))
+
+        self.ddpm.layer_norm = nn.LayerNorm(args.ddpm_dim, eps=1e-12)
+        self.ddpm.dropout = torch.nn.Dropout(0.1)
 
         self.context_encoder = context_encoder
         self.args = args
 
-        assert self.args.context_mode in ["style", "context", "context+style"]
-
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        assert self.args.context_mode in ["style", "context", "context+style", ""]
 
     @staticmethod
     def get_sinusoidal_embedding(x, dim):
         half_dim = dim // 2
-        emb = np.log(10000) / (half_dim - 1)
+        emb = np.log(10000) / half_dim
 
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
         emb = emb.to(device=x.device)
@@ -59,16 +62,34 @@ class TextDDPM(nn.Module):
             emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
         return emb
 
-    def forward(self, noisy_x, timesteps, context=None):
-        noisy_x = self.ddpm.input_projection(noisy_x)
+    @staticmethod
+    def get_extended_attention_mask(attention_mask, dtype):
+        extended_attention_mask = attention_mask[:, None, None, :]
+        extended_attention_mask = extended_attention_mask.to(dtype=dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
+        return extended_attention_mask
+
+    def forward(self, x_t, timesteps, attention_mask=None, context=None):
+        if context is not None:
+            context = context.to(x_t.dtype)
+        seq_length = x_t.shape[1]
+        emb_x = self.ddpm.input_projection(x_t)
+
+        position_ids = self.position_ids[:, : seq_length]
+        pos_emb = self.ddpm.position_embeddings(position_ids)
 
         timesteps_emb = self.get_sinusoidal_embedding(timesteps, self.args.hidden_t_dim)
         timesteps_emb = self.ddpm.time_emb(timesteps_emb)
 
-        noisy_x = noisy_x + timesteps_emb[:, None, :]
+        emb_inputs = emb_x + pos_emb + timesteps_emb[:, None, :]
+        emb_inputs = self.ddpm.dropout(self.ddpm.layer_norm(emb_inputs))
+
+        if attention_mask is not None:
+            attention_mask = self.get_extended_attention_mask(attention_mask, emb_inputs.dtype)
         model_pred = self.ddpm(
-            inputs_embeds=noisy_x,
-            encoder_hidden_states=context
+            emb_inputs,
+            encoder_hidden_states=context,
+            attention_mask=attention_mask,
         )["last_hidden_state"]
         model_pred = self.ddpm.output_projection(model_pred)
         return model_pred
@@ -117,6 +138,10 @@ class TextCNN(nn.Module):
 
     def forward(self, inp):
         inp = self.embeder(inp).unsqueeze(1)
+        if inp.shape[1] < 5:
+            pad = inp.new_zeros(inp.shape[0], 5 - inp.shape[-2], inp.shape[-1])
+            inp = torch.cat((inp, pad), -2)
+
         convs = [F.relu(conv(inp)).squeeze(3) for conv in self.convs]
         pools = [F.max_pool1d(conv, conv.size(2)).squeeze(2) for conv in convs]
         out = torch.cat(pools, 1)

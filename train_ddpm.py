@@ -5,8 +5,8 @@ from torch import nn
 
 from tqdm.auto import tqdm
 
-from dataset import get_dataloader
-from transformers import T5ForConditionalGeneration, T5Config, AutoTokenizer
+from dataset import get_dataloader, inf_dataloader
+from transformers import T5ForConditionalGeneration, T5Config, AutoTokenizer, BertModel, BertConfig, BertTokenizerFast
 
 import wandb
 
@@ -14,53 +14,60 @@ from evaluation import Evaluator
 from model import TextDDPM
 from trainer import Trainer
 
-wandb.login()
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
     # DATASET
-    parser.add_argument("--data_folder", type=str, default='GYAFC/Family_Relationships', help="Data path")
+    parser.add_argument("--dataset", type=str, default='gyafc', help="Dataset")
+    # parser.add_argument("--data_folder", type=str, default='datasets/GYAFC/Family_Relationships', help="Data path")
     parser.add_argument("--models_folder", type=str, default='models', help="Data path")
 
-    parser.add_argument("--labels", type=str, default=('formal', 'informal'), nargs="+", help="Style label names")
+    parser.add_argument("--labels", type=str, default=[], nargs="+", help="Style label names")
 
-    parser.add_argument("--max_text_len", type=int, default=50, help="Maximum length of text")
-    parser.add_argument("--encoding_mean", type=float, default=-0.01006, help="Mean value used for normalization")
-    parser.add_argument("--encoding_std", type=float, default=0.45312, help="Std value used for normalization")
+    parser.add_argument("--max_text_len", type=int, default=32, help="Maximum length of text")
 
     # MODEL
     parser.add_argument("--context_mode", type=str, default='context', help="Context information for model")
 
-    parser.add_argument("--context_dim", type=int, default=512, help="Hidden dimension of Context Encoder output")
+    parser.add_argument("--context_dim", type=int, default=768, help="Hidden dimension of Context Encoder output")
     parser.add_argument("--embedding_dim", type=int, default=768, help="Hidden dimension of input DDPM encodings")
-    parser.add_argument("--hidden_t_dim", type=int, default=128, help="Hidden dimension of timestep encodings")
+    parser.add_argument("--hidden_t_dim", type=int, default=768, help="Hidden dimension of timestep encodings")
 
-    parser.add_argument("--ddpm_dim", type=int, default=512, help="Hidden dimension of ddpm")
+    parser.add_argument("--ddpm_dim", type=int, default=768, help="Hidden dimension of ddpm")
+    parser.add_argument("--ddpm_num_hidden_layers", type=int, default=12, help="Number of hidden layers of ddpm")
 
     # TRAINING
     parser.add_argument("--train_context", action="store_true", help="True if we Context Encoder in trainable")
-    parser.add_argument("--noise_scheduler", type=str, default='sqrt', help="Noise scheduler type")
-    parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Amount of timesteps for diffusion")
+    parser.add_argument("--noise_scheduler", type=str, default='linear', help="Noise scheduler type")
+    parser.add_argument("--num_train_timesteps", type=int, default=2000, help="Amount of timesteps for diffusion")
 
     parser.add_argument("--ddpm_lr", type=float, default=1e-4, help="DDPM learning rate")
     parser.add_argument("--ce_lr", type=float, default=1e-4, help="Contex Encoder learning rate")
+    parser.add_argument("--num_warmup", type=int, default=5000, help="Number of warmup steps")
 
-    parser.add_argument("--n_epochs", type=int, default=200, help="Number of epoches")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--training_iters", type=int, default=350_000, help="Number of training iterations")
+    parser.add_argument("--eval_every", type=int, default=10_000, help="Evaluate every n iters")
 
-    parser.add_argument("--eval_epoch_step", type=int, default=10, help="Evaluate every nth epoch")
+    parser.add_argument("--mp", action="store_true", help="Mixed precision")
+
     parser.add_argument("--evaluation_metrics",
-                        type=str, default=('bleu', 'self_bleu', 'style_accuracy'),
+                        type=str, default=['bloom'],
                         nargs="+", help="Metrics for evaluation"
     )
 
     args = parser.parse_args()
 
+    if args.dataset == 'gyafc':
+        args.labels = ['formal', 'informal']
+    elif args.dataset == 'yelp':
+        args.labels = ['positive', 'negative']
     return args
 
 
 if __name__ == '__main__':
+    wandb.login()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     args = parse_args()
@@ -68,25 +75,37 @@ if __name__ == '__main__':
 
     is_style_transfer = 'style' in args.context_mode
 
-    train_data_paths = [os.path.join(args.data_folder, f'train/{style}') for style in args.labels]
-    train_loader = get_dataloader(train_data_paths, args, shuffle=True)
-    val_data_paths = [os.path.join(args.data_folder, f'tune/{style}') for style in args.labels]
+    train_loader = inf_dataloader(get_dataloader('train', args, shuffle=True))
     if is_style_transfer:
         val_loaders = [
-            get_dataloader(val_data_paths[:1], args, shuffle=False),
-            get_dataloader(val_data_paths[1:], args, shuffle=False)
+            get_dataloader('validation', args, label=label, shuffle=False) for label in args.labels
         ]
     else:
-        val_loaders = [get_dataloader(val_data_paths, args, shuffle=False)]
+        val_loaders = [get_dataloader('validation', args, shuffle=False)]
 
-    t5_config = T5Config(d_model=args.ddpm_dim, d_ff=args.ddpm_dim * 4)
-    ddpm = T5ForConditionalGeneration(t5_config).decoder.to(device)
+    config = BertConfig.from_pretrained('bert-base-uncased')
+    config.hidden_size = args.ddpm_dim
+    config.num_hidden_layers = args.ddpm_num_hidden_layers
+    # config.num_attention_heads = 8
+    config.is_decoder = True
+    if len(args.context_mode) > 0:
+        config.add_cross_attention = True
+    ddpm = BertModel(config).encoder
 
-    if args.train_context:
-        context_encoder = T5ForConditionalGeneration(t5_config).encoder.to(device)
+    # t5_config = T5Config(d_model=args.ddpm_dim, d_ff=args.ddpm_dim * 4)
+    # ddpm = T5ForConditionalGeneration(t5_config).decoder
+
+    if 'context' in args.context_mode:
+        if args.train_context:
+            context_encoder = BertModel(BertConfig.from_pretrained("bert-base-uncased"))
+            # context_encoder = T5ForConditionalGeneration(t5_config).encoder
+        else:
+            context_encoder = BertModel.from_pretrained("bert-base-uncased").eval()
+            # context_encoder = T5ForConditionalGeneration.from_pretrained("t5-small").encoder
+        context_tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     else:
-        context_encoder = T5ForConditionalGeneration.from_pretrained("t5-small").encoder.to(device)
-    context_tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        context_encoder = None
+        context_tokenizer = None
 
     text_ddpm = TextDDPM(args, ddpm, context_encoder=context_encoder)
 
@@ -95,16 +114,22 @@ if __name__ == '__main__':
     print(args)
 
     slurm_job_id = os.environ.get('SLURM_JOB_ID')
-    name = f'text_diffusion_{slurm_job_id}'
+    name = f'{args.dataset}_"{args.context_mode}"{args.mp}mp_{args.batch_size}bs_{args.noise_scheduler}noise_{slurm_job_id}'
 
     wandb_config = {
+        'dataset': args.dataset,
         'context_mode': args.context_mode,
+        'num_train_timesteps': args.num_train_timesteps,
         'noise_scheduler': args.noise_scheduler,
         'batch_size': args.batch_size,
         'evaluation_metrics': args.evaluation_metrics,
         'train_context': args.train_context,
         'ddpm_dim': args.ddpm_dim,
-        'labels': args.labels
+        'ddpm_num_hidden_layers': args.ddpm_num_hidden_layers,
+        'labels': args.labels,
+        'max_text_len': args.max_text_len,
+        'mp': args.mp,
+        'ddpm_params': sum(p.numel() for p in text_ddpm.ddpm.parameters()),
     }
     wandb.init(
         project='text_duffusion',
@@ -112,33 +137,40 @@ if __name__ == '__main__':
         config=wandb_config
     )
 
-    for e in tqdm(range(args.n_epochs)):
+    try:
+        os.mkdir(f'logs/{slurm_job_id}')
+    except:
+        pass
+
+    e = 0
+    while True:
+    # for e in tqdm(range(args.n_epochs)):
         trainer.train_one_epoch(
             train_loader
         )
 
-        if e % args.eval_epoch_step == 0:
-            results = {}
-            if is_style_transfer:
-                for style_label in range(2):
-                    style_name = train_loader.dataset.idx_to_label[style_label]
-                    eval_results = evaluator.evaluate(
-                        text_ddpm,
-                        style_label=style_label,
-                        predictions_path=f'logs/{name}_epoch{e}_{style_name}'
-                    )
-                    for key, value in eval_results.items():
-                        results[f'{key}_{style_name}'] = value
-            else:
+        results = {}
+        if is_style_transfer:
+            for style_label in range(2):
+                style_name = trainer.idx_to_label[style_label]
                 eval_results = evaluator.evaluate(
                     text_ddpm,
-                    predictions_path=f'logs/{name}_epoch{e}'
+                    style_label=style_label,
+                    predictions_path=f'logs/{slurm_job_id}/epoch{e}_{style_name}_{name}'
                 )
-                results = eval_results
+                for key, value in eval_results.items():
+                    results[f'{key}_{style_name}'] = value
+        else:
+            eval_results = evaluator.evaluate(
+                text_ddpm,
+                predictions_path=f'logs/{slurm_job_id}/epoch{e}_{name}'
+            )
+            results = eval_results
 
-            wandb.log(results)
+        wandb.log(results)
 
-        if e % 50 == 49:
+        if e % 10 == 9:
             trainer.ddpm.save(os.path.join(args.models_folder, f'{name}.pt'))
+        e += 1
 
     trainer.ddpm.save(os.path.join(args.models_folder, f'{name}.pt'))
